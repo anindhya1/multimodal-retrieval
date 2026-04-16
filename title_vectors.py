@@ -125,7 +125,9 @@ KNOWN_GENRES = [
 INDEX_PATH   = Path("title_index.faiss")
 META_PATH    = Path("title_meta.json")
 VECTORS_PATH = Path("title_vectors.npy")
-UMAP_PATH    = Path("umap_titles.html")
+UMAP_2D_DIR  = Path("2d_umaps")
+UMAP_3D_DIR  = Path("3d_umaps")
+UMAP_PATH    = UMAP_3D_DIR / "umap_titles.html"
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -782,9 +784,12 @@ def interactive_search(
                 query_full /= norm
 
             safe_name = "".join(c if c.isalnum() else "_" for c in raw)[:40]
-            umap_out  = Path(f"umap_query_{safe_name}.html")
-            visualise(vectors, titles, out_path=umap_out,
+            umap_out_3d = UMAP_3D_DIR / f"umap_query_{safe_name}.html"
+            visualise(vectors, titles, out_path=umap_out_3d,
                       query_vec=query_full, query_label=raw)
+            umap_out_2d = UMAP_2D_DIR / f"umap_query_{safe_name}.png"
+            visualise_2d(vectors, titles, out_path=umap_out_2d,
+                         query_vec=query_full, query_label=raw)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -881,8 +886,90 @@ def visualise(
     )
 
     out_html = out_path.with_suffix(".html")
+    out_html.parent.mkdir(parents=True, exist_ok=True)
     fig.write_html(str(out_html))
     print(f"  Saved → {out_html}")
+
+
+def visualise_2d(
+    vectors: np.ndarray,
+    titles: list[dict],
+    out_path: Path = UMAP_2D_DIR / "umap_titles.png",
+    query_vec: np.ndarray | None = None,
+    query_label: str = "Query",
+) -> None:
+    if not HAS_UMAP:
+        print("  umap-learn not installed — skipping 2D visualisation.  (pip install umap-learn)")
+        return
+
+    n = len(titles)
+    n_neighbors = min(15, n - 1)
+
+    all_vecs = vectors if query_vec is None else np.vstack([vectors, query_vec.reshape(1, -1)])
+
+    print(f"\nRunning 2D UMAP on {len(all_vecs)} points (n_neighbors={n_neighbors}) …")
+    reducer = umap_lib.UMAP(
+        n_components=2,
+        metric="cosine",
+        n_neighbors=n_neighbors,
+        min_dist=0.1,
+        random_state=42,
+        n_jobs=1,
+    )
+    emb = reducer.fit_transform(all_vecs)   # (N [+1], 2)
+
+    corpus_emb = emb[:n]
+    query_emb  = emb[n] if query_vec is not None else None
+
+    type_labels  = [t.get("type") or "unknown" for t in titles]
+    unique_types = sorted(set(type_labels))
+    palette = [
+        "#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd",
+        "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf",
+    ]
+    type_color = {tp: palette[i % len(palette)] for i, tp in enumerate(unique_types)}
+
+    fig, ax = plt.subplots(figsize=(12, 8))
+
+    for tp in unique_types:
+        idxs = [i for i, t in enumerate(titles) if (t.get("type") or "unknown") == tp]
+        ax.scatter(
+            corpus_emb[idxs, 0], corpus_emb[idxs, 1],
+            c=type_color[tp], label=tp, s=20, alpha=0.75,
+        )
+        for i in idxs:
+            ax.annotate(
+                titles[i]["title"][:20],
+                (corpus_emb[i, 0], corpus_emb[i, 1]),
+                fontsize=5, alpha=0.6,
+            )
+
+    if query_emb is not None:
+        ax.scatter(
+            [query_emb[0]], [query_emb[1]],
+            c="red", s=120, marker="D", zorder=5, label=f"Query: «{query_label}»",
+            edgecolors="black", linewidths=1,
+        )
+        ax.annotate(
+            f"Query: «{query_label}»",
+            (query_emb[0], query_emb[1]),
+            fontsize=8, color="red", fontweight="bold",
+        )
+
+    title_str = f"Title embedding space — UMAP 2D  ({n} titles, {TOTAL_DIM}-dim vectors)"
+    if query_vec is not None:
+        title_str += f"\nQuery: «{query_label}»"
+    ax.set_title(title_str, fontsize=10)
+    ax.set_xlabel("UMAP-1")
+    ax.set_ylabel("UMAP-2")
+    ax.legend(loc="best", fontsize=7, markerscale=1.5)
+    fig.tight_layout()
+
+    out_png = out_path.with_suffix(".png")
+    out_png.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(str(out_png), dpi=150)
+    plt.close(fig)
+    print(f"  Saved → {out_png}")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
