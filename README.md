@@ -14,7 +14,7 @@ A multimodal vector indexing and similarity search system for movie/TV titles. E
                             type one-hot (×5) · genre multi-hot (×20)
 ```
 
-All sub-vectors are L2-normalised before concatenation; the final fused vector is L2-normalised again, making inner-product search equivalent to cosine similarity.
+Each sub-vector is L2-normalised individually before concatenation. The final fused vector is L2-normalised again, making inner-product search equivalent to cosine similarity.
 
 ---
 
@@ -22,7 +22,7 @@ All sub-vectors are L2-normalised before concatenation; the final fused vector i
 
 | File | Role |
 |---|---|
-| `title_vectors.py` | Main script — builds vectors, FAISS index, UMAP plot, interactive search |
+| `title_vectors.py` | Main script — builds vectors, FAISS index, interactive search + per-query UMAP |
 | `db.py` | Database clients (PostgreSQL via SQLAlchemy, Qdrant) |
 | `extract_audio.py` | Extracts 16kHz mono WAV files from HLS streams via ffmpeg (called on `--rebuild`) |
 
@@ -56,10 +56,10 @@ Core packages used:
 | `torch` | Model inference |
 | `openai-whisper` | Audio encoder (hidden states, not transcription) |
 | `llama-index-core` | `SentenceSplitter` for text chunking |
-| `umap-learn` | 2D visualisation (optional) |
+| `umap-learn` | Dimensionality reduction for per-query visualisation (optional) |
+| `plotly` | Interactive 3D UMAP HTML output (optional, required alongside umap-learn) |
 | `python-dotenv` | Environment variable loading |
 | `tqdm` | Progress bars |
-| `matplotlib` | UMAP plot rendering |
 
 ### Environment variables
 
@@ -103,15 +103,14 @@ python title_vectors.py --rebuild         # force rebuild and re-extract missing
 **What it does:**
 
 1. Fetches titles from PostgreSQL ordered by popularity
-2. Fetches SigLIP2 visual vectors from Qdrant (top 50 stills per title, averaged)
+2. Fetches SigLIP2 visual vectors from Qdrant (top 50 stills per title, averaged then re-normalised to unit length)
 3. Fetches cast & crew from `title_persons` / `persons` (up to 20 per title, directors first)
 4. Extracts and encodes audio with the Whisper encoder (if WAV files exist in `./audio/`)
 5. Encodes text with all-MiniLM-L6-v2 (chunked via LlamaIndex `SentenceSplitter`, 256-token chunks with 32-token overlap)
 6. Encodes structured metadata (year, popularity, IMDB rating, type, genres)
-7. Fuses all modalities → 1,693-dim L2-normalised vector per title
+7. L2-normalises each modality vector individually, concatenates them → 1,693-dim vector, then L2-normalises the fused result
 8. Builds a FAISS `IndexFlatIP` and persists it to disk
-9. Renders a UMAP 2D scatter plot coloured by title type → `umap_titles.png`
-10. Launches an interactive dual-encoder similarity search loop
+9. Launches an interactive dual-encoder similarity search loop
 
 **Cached outputs** (`title_index.faiss`, `title_meta.json`, `title_vectors.npy`) are reused on subsequent runs unless `--rebuild` is passed.
 
@@ -122,23 +121,21 @@ python title_vectors.py --rebuild         # force rebuild and re-extract missing
 ```
 PostgreSQL titles
        │
-       ├── text fields ──→ all-MiniLM-L6-v2 ──→ 384-dim text vector
-       │    (title, description,
-       │     genres, keywords, cast)
-       │
-       ├── media_items ──→ Qdrant (siglip-768) ──→ mean pool ──→ 768-dim visual vector
-       │    (top 50 stills by aesthetic_score)
-       │
-       ├── audio/<cuid2>.wav ──→ Whisper encoder ──→ mean pool ──→ 512-dim audio vector
-       │    (populated by extract_audio.py)
-       │
-       └── structured fields ──→ normalise / one-hot / multi-hot ──→ 29-dim metadata vector
+       ├── text fields ──→ all-MiniLM-L6-v2 ──→ 384-dim ──→ L2-normalise ──┐
+       │    (title, description,                                              │
+       │     genres, keywords, cast)                                         │
+       │                                                                     │
+       ├── media_items ──→ Qdrant (siglip-768) ──→ mean+renorm ──→ 768-dim ──→ L2-normalise ──┤ concat → 1693-dim → L2-normalise
+       │    (top 50 stills by aesthetic_score)                               │
+       │                                                                     │
+       ├── audio/<cuid2>.wav ──→ Whisper encoder ──→ 512-dim ──→ L2-normalise ──┤
+       │    (populated by extract_audio.py)                                  │
+       │                                                                     │
+       └── structured fields ──→ normalise / one-hot / multi-hot ──→ 29-dim ──→ L2-normalise ──┘
             (year, popularity, IMDB rating, type, genres)
-
-All four sub-vectors concatenated → 1,693-dim fused vector → L2-normalise
-                                                                    │
-                                                              FAISS IndexFlatIP
-                                                         (inner product = cosine sim)
+                                                                             │
+                                                                       FAISS IndexFlatIP
+                                                                  (inner product = cosine sim)
 ```
 
 ---
@@ -162,6 +159,8 @@ Search: quit
 
 Results display the combined score, individual text and visual sub-scores, and a flag for titles that have Qdrant image vectors.
 
+After each query, a 3D interactive UMAP visualisation is generated and saved as `umap_query_<query>.html`. The corpus titles are plotted and coloured by title type; the query is placed in the same space and shown as a red diamond, so you can see which region of the embedding space the query lands in relative to the titles.
+
 ---
 
 ## Database Schema (relevant tables)
@@ -183,4 +182,4 @@ Results display the combined score, individual text and visual sub-scores, and a
 | `title_vectors.npy` | Raw `(N, 1693)` float32 vector matrix |
 | `title_index.faiss` | Persisted FAISS `IndexFlatIP` |
 | `title_meta.json` | Title metadata aligned to FAISS index positions |
-| `umap_titles.png` | 2D UMAP scatter plot of the embedding space |
+| `umap_query_<query>.html` | Per-query interactive 3D UMAP plot (corpus + query point) |

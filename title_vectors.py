@@ -232,10 +232,19 @@ def fetch_visual_vectors(title_ids: list[int]) -> dict[int, np.ndarray]:
                 accum.setdefault(tid, []).append(arr)
 
     # 3. Average per title
-    return {
-        tid: np.mean(vecs, axis=0)
-        for tid, vecs in accum.items()
-    }
+    output = {}
+    for tid, vecs in accum.items():
+        # Calculate the mean (Magnitude shrinks here!)
+        mean_vec = np.mean(vecs, axis=0)
+        
+        # FIX: Re-inflate to Unit Length (1.0)
+        norm = np.linalg.norm(mean_vec)
+        if norm > 1e-9: 
+            mean_vec = mean_vec / norm
+            
+        output[tid] = mean_vec
+        
+    return output
 
 
 def fetch_title_persons(title_ids: list[int]) -> dict[int, list[dict]]:
