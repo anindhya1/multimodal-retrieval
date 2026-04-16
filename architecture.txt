@@ -1,0 +1,11 @@
+34 tables in total. Breaking them down by relevance to our pipeline:                                                             
+                                                                                                                                  
+  Content / title-related (what we care about):                                                                                    
+  1. titles                                                                                                                        
+  2. media_items                                                                                                                   
+  3. media_item_vectors                                                                                                            
+  4. media_item_effects                                                                                                          
+  5. effects                                                                                                                       
+  6. persons
+  7. title_persons                                                                                                                 
+  8. title_series 

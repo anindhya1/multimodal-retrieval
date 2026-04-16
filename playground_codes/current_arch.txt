@@ -1,0 +1,62 @@
+ ---                                                                                                                              
+  Overall Architecture                                                                                                             
+                                                                                                                                   
+  A multimodal movie retrieval system using late fusion of three encoders (X-CLIP, SigLIP2, CLAP) to build a searchable FAISS index
+   of movies.                                                                                                                      
+                                                                                                                                   
+  ---                                                                                                                              
+  Data Structures                                                                                                                  
+                                                                                                                                   
+  - MovieData — raw input per movie: video path, image paths, text chunks, audio paths
+  - MovieEmbedding — processed output: per-modality projected vectors + a single fused vector                                      
+                                                                                                                                   
+  ---                                                                                                                              
+  Encoders (3 towers)                                                                                                              
+                                                                                                                                   
+  ┌────────────────┬─────────────────────┬────────────┬──────────────────────────────────────┐
+  │    Encoder     │        Input        │ Output Dim │                Model                 │                                     
+  ├────────────────┼─────────────────────┼────────────┼──────────────────────────────────────┤
+  │ SigLIP2Encoder │ images or text      │ 1152-d     │ google/siglip2-so400m-patch16-naflex │
+  ├────────────────┼─────────────────────┼────────────┼──────────────────────────────────────┤
+  │ CLAPEncoder    │ audio files (48kHz) │ 512-d      │ laion/clap-htsat-unfused             │                                     
+  ├────────────────┼─────────────────────┼────────────┼──────────────────────────────────────┤                                     
+  │ XCLIPEncoder   │ .mp4 video          │ 512-d      │ microsoft/xclip-base-patch32         │                                     
+  └────────────────┴─────────────────────┴────────────┴──────────────────────────────────────┘                                     
+                  
+  X-CLIP's _sample_frames() runs a two-pass scene detection using HSV histogram correlation, then samples exactly 8 frames per     
+  scene and mean-pools scene vectors into one clip-level vector.
+                                                                                                                                   
+  ---             
+  Ingestion Pipeline (per movie)
+                                
+  1. X-CLIP encodes clip.mp4 → 512-d video vector
+  2. SigLIP2 vision encodes keyframes (reusing X-CLIP's extracted frames, or fallback to image_paths) → 1152-d image vectors       
+  3. SigLIP2 text encodes [whisper_transcript, title_ocr] → 1152-d text vectors                                                    
+  4. CLAP encodes [no_vocals.wav, vocals.wav] → 512-d audio vectors                                                                
+  5. DimensionAligner projects everything to a common 512-d:                                                                       
+    - SigLIP2 (1152-d) → orthogonal random projection → 512-d, then re-normalize                                                   
+    - X-CLIP/CLAP (already 512-d) → identity (no-op)                                                                               
+  6. LateFusionAggregator mean-pools within each modality, then takes a weighted average across modalities (video=0.35, text=0.30, 
+  audio=0.20, image=0.15), then L2-normalizes into a single 512-d fused vector                                                     
+  7. MovieVectorIndex (FAISS IndexFlatIP) stores the fused vector with movie metadata                                              
+                                                                                                                                   
+  ---             
+  Query Pipeline                                                                                                                   
+                                                                                                                                   
+  1. User text → SigLIP2 text encoder → 1152-d → project → 512-d
+  2. FAISS cosine similarity search → top-K movies                                                                                 
+                                                                                                                                   
+  ---                                                                                                                              
+  Entry Points (__main__)                                                                                                          
+                                                                                                                                   
+  - run_real_pipeline() (default): loads trailer_data/trailers_metadata.json, initializes real models, ingests all movies (with
+  resume/checkpoint support every 10 movies), saves the FAISS index, then starts an interactive search loop                        
+  - run_search_only() (--search-only): skips ingestion, loads the saved FAISS index directly, starts the search loop
+  - --reindex flag: forces re-encoding everything from scratch even if an index exists                                             
+  - demo_with_synthetic_data(): runs the full pipeline with randomly generated genre-clustered vectors (no GPU/models needed)      
+                                                                                                                                   
+  ---                                                                                                                              
+  Visualization                                                                                                                    
+                  
+  MovieSpaceVisualizer uses UMAP to project all 512-d fused vectors to 3D, then renders an interactive Plotly 3D scatter plot
+  colored by genre, with retrieved results highlighted and the query point marked as a red diamond. Saved as an .html file.  

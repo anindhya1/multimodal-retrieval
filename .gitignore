@@ -1,0 +1,30 @@
+# ── Environment & secrets ─────────────────────────────────────────────────────
+.env
+.env.*
+
+# ── Python ────────────────────────────────────────────────────────────────────
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# ── Generated index & vector files ───────────────────────────────────────────
+*.faiss
+*.npy
+title_meta.json
+
+# ── Generated UMAP outputs ────────────────────────────────────────────────────
+# umap_titles.html
+# umap_titles.png
+# umap_query_*.html
+
+# ── Downloaded / extracted data directories ──────────────────────────────────
+audio/
+trailer_data/
+mmtrail_data/
+queried_tables/
+2d_umaps/
+
+# ── macOS ─────────────────────────────────────────────────────────────────────
+.DS_Store
