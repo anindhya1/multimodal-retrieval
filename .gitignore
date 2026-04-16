@@ -25,6 +25,7 @@ trailer_data/
 mmtrail_data/
 queried_tables/
 2d_umaps/
+3d_umaps/
 
 # ── macOS ─────────────────────────────────────────────────────────────────────
 .DS_Store
