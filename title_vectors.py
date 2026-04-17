@@ -67,10 +67,10 @@ except ImportError:
     HAS_UMAP = False
 
 try:
-    import whisper as whisper_lib
-    HAS_WHISPER = True
+    from transformers import ClapModel, ClapProcessor
+    HAS_CLAP = True
 except ImportError:
-    HAS_WHISPER = False
+    HAS_CLAP = False
 
 try:
     import plotly.graph_objects as go
@@ -87,7 +87,7 @@ from db import pg, qdrant, Collections
 
 TEXT_DIM    = 384
 VISUAL_DIM  = 768    # SigLIP2 ViT-B (Base) vectors stored in Qdrant STILLS collection
-AUDIO_DIM   = 512    # Whisper base encoder hidden state (mean-pooled)
+AUDIO_DIM   = 512    # CLAP larger_clap_general audio embedding
 META_DIM    = 29     # breakdown: see encode_metadata
 TOTAL_DIM   = TEXT_DIM + VISUAL_DIM + AUDIO_DIM + META_DIM   # 1 693
 
@@ -99,7 +99,7 @@ CHUNK_SIZE       = 256   # LlamaIndex SentenceSplitter chunk size (tokens)
 CHUNK_OVERLAP    = 32    # overlap between consecutive chunks (tokens)
 
 SIGLIP2_MODEL_ID  = "google/siglip2-base-patch16-224"
-WHISPER_MODEL_ID  = "base"   # Whisper base → 512-dim encoder output
+CLAP_MODEL_ID     = "laion/larger_clap_general"   # CLAP → 512-dim shared text-audio space
 AUDIO_DIR         = Path("audio")   # where extract_audio.py saves WAV files
 
 # Vector slice boundaries
@@ -135,7 +135,18 @@ UMAP_PATH    = UMAP_3D_DIR / "umap_titles.html"
 # ──────────────────────────────────────────────────────────────────────────────
 
 def fetch_titles(limit: int) -> list[dict]:
-    """Fetch `limit` titles ordered by popularity, with media item count."""
+    """
+    Fetch `limit` titles split evenly across movies, tvSeries, and musicVideos
+    (one-third each, ordered by popularity within each type).
+    If limit is not divisible by 3, the remainder goes to movies.
+    """
+    per_type, remainder = divmod(limit, 3)
+    type_limits = {
+        "movie":       per_type + remainder,
+        "tvSeries":    per_type,
+        "musicVideo":  per_type,
+    }
+
     sql = text("""
         SELECT
             t.id,
@@ -155,12 +166,18 @@ def fetch_titles(limit: int) -> list[dict]:
                ON mi.title_id = t.id
               AND mi.deleted_at IS NULL
         WHERE t.deleted_at IS NULL
+          AND t.type = :type
         GROUP BY t.id
         ORDER BY t.popularity DESC NULLS LAST
         LIMIT :limit
     """)
+
+    rows = []
     with pg.connect() as conn:
-        rows = conn.execute(sql, {"limit": limit}).mappings().fetchall()
+        for title_type, n in type_limits.items():
+            result = conn.execute(sql, {"type": title_type, "limit": n}).mappings().fetchall()
+            rows.extend(result)
+
     return [dict(r) for r in rows]
 
 
@@ -452,41 +469,49 @@ def encode_query_visual(text: str) -> np.ndarray:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 4.  Audio encoder  (Whisper encoder hidden states → 512-dim)
+# 4.  Audio encoder  (CLAP → 512-dim shared text-audio space)
 # ──────────────────────────────────────────────────────────────────────────────
 
-_whisper_model = None
+_clap_model     = None
+_clap_processor = None
 
 
-def _load_whisper():
-    global _whisper_model
-    if _whisper_model is None:
-        if not HAS_WHISPER:
-            raise RuntimeError("pip install openai-whisper")
-        print(f"Loading Whisper ({WHISPER_MODEL_ID}) …")
-        _whisper_model = whisper_lib.load_model(WHISPER_MODEL_ID)
-        _whisper_model.eval()
+def _load_clap():
+    global _clap_model, _clap_processor
+    if _clap_model is None:
+        if not HAS_CLAP:
+            raise RuntimeError("pip install transformers  # ClapModel requires transformers>=4.31")
+        if not HAS_TORCH:
+            raise RuntimeError("pip install torch")
+        print(f"Loading CLAP ({CLAP_MODEL_ID}) …")
+        _clap_processor = ClapProcessor.from_pretrained(CLAP_MODEL_ID)
+        _clap_model     = ClapModel.from_pretrained(CLAP_MODEL_ID)
+        _clap_model.eval()
 
 
 def build_audio_map(cuid2s: list[str]) -> dict[str, np.ndarray]:
     """
     For each title cuid2, look for a WAV file in AUDIO_DIR and encode it
-    using Whisper's encoder (not the decoder/transcriber).
+    using CLAP's audio encoder.
 
     Pipeline per file:
-      1. Load WAV → resample to 16kHz mono numpy array
-      2. Pad or trim to 30 s  (Whisper's fixed context window)
-      3. Compute 80-channel log-mel spectrogram
-      4. Pass through Whisper encoder  →  (1, 1500, 512)
-      5. Mean-pool over time           →  (512,)
-      6. L2-normalise                  →  unit vector
+      1. Load WAV with scipy → float32 array at 16kHz mono
+      2. Pass through ClapProcessor + ClapModel.get_audio_features → (512,)
+      3. L2-normalise → unit vector
 
     Returns {cuid2: audio_vector(512)}.  Titles with no WAV are omitted.
+    The resulting vectors share the same 512-dim space as encode_query_audio(),
+    so text queries can be compared directly against stored audio vectors.
     """
     if not cuid2s:
         return {}
 
-    _load_whisper()
+    _load_clap()
+
+    import scipy.io.wavfile as wav_io
+    import scipy.signal as sig_resample
+
+    CLAP_SR = 48000   # CLAP was trained at 48kHz
 
     result: dict[str, np.ndarray] = {}
     for cuid2 in cuid2s:
@@ -494,17 +519,22 @@ def build_audio_map(cuid2s: list[str]) -> dict[str, np.ndarray]:
         if not wav_path.exists():
             continue
         try:
-            audio = whisper_lib.load_audio(str(wav_path))          # float32 numpy, 16kHz
-            audio = whisper_lib.pad_or_trim(audio)                  # exactly 30 s
-            mel   = whisper_lib.log_mel_spectrogram(audio)          # (80, 3000)
-            if HAS_TORCH:
-                mel = mel.to(next(_whisper_model.parameters()).device)
-                with torch.no_grad():
-                    enc = _whisper_model.encoder(mel.unsqueeze(0))  # (1, 1500, 512)
-                vec = enc.mean(dim=1).squeeze(0).cpu().numpy()      # (512,)
-            else:
-                continue   # Whisper encoder requires torch
-            vec = vec.astype(np.float32)
+            sr, audio = wav_io.read(str(wav_path))
+            if audio.ndim > 1:
+                audio = audio.mean(axis=1)           # stereo → mono
+            audio = audio.astype(np.float32)
+            if audio.max() > 1.0:
+                audio /= 32768.0                     # int16 → float32 [-1, 1]
+            if sr != CLAP_SR:
+                num_samples = int(len(audio) * CLAP_SR / sr)
+                audio = sig_resample.resample(audio, num_samples)
+            inputs = _clap_processor(
+                audio=audio, sampling_rate=CLAP_SR, return_tensors="pt"
+            )
+            with torch.no_grad():
+                audio_out = _clap_model.audio_model(**inputs)
+                vec = _clap_model.audio_projection(audio_out.pooler_output)  # (1, 512)
+            vec = vec[0].cpu().numpy().astype(np.float32)           # (512,)
             norm = np.linalg.norm(vec)
             result[cuid2] = (vec / norm) if norm > 0 else vec
         except Exception as e:
@@ -519,6 +549,22 @@ def encode_audio(cuid2: str, audio_map: dict[str, np.ndarray]) -> np.ndarray:
     if vec is None:
         return np.zeros(AUDIO_DIM, dtype=np.float32)
     return vec
+
+
+def encode_query_audio(query: str) -> np.ndarray:
+    """
+    Encode a text query into CLAP's 512-dim audio embedding space.
+    Because CLAP is trained contrastively on (audio, text) pairs, this vector
+    is directly comparable to stored CLAP audio vectors via inner product.
+    """
+    _load_clap()
+    inputs = _clap_processor(text=[query], return_tensors="pt", padding=True)
+    with torch.no_grad():
+        text_out = _clap_model.text_model(**inputs)
+        vec = _clap_model.text_projection(text_out.pooler_output)[0]  # (512,)
+    vec = vec.cpu().numpy().astype(np.float32)
+    norm = np.linalg.norm(vec)
+    return (vec / norm).astype(np.float32) if norm > 0 else vec
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -688,27 +734,24 @@ def interactive_search(
     alpha: float = SEARCH_ALPHA,
 ) -> None:
     """
-    Interactive dual-encoder search loop.
+    Interactive tri-encoder search loop.
 
     For each query:
       1. Encode with all-MiniLM  → search text sub-index   (384-dim)
       2. Encode with SigLIP2     → search visual sub-index (768-dim)
-      3. Combine: alpha * text_score + (1-alpha) * visual_score
-      4. Re-rank and display top-k
-
-    Audio is a stored modality (affects global vector clustering) but is not
-    queried directly — there is no text→audio encoder to project a text query
-    into Whisper's hidden-state space.
+      3. Encode with CLAP        → search audio sub-index  (512-dim)
+      4. Combine: alpha * text_score + beta * visual_score + (1-alpha-beta) * audio_score
 
     The query does not need to exist in the indexed set.
-    Commands: 'quit' to exit · 'list' to browse titles · 'alpha <0-1>' to tune weight
+    Commands: 'quit' · 'list' · 'alpha <0-1>' · 'beta <0-1>'
     """
-    print("\n" + "=" * 65)
-    print("  DUAL-ENCODER SIMILARITY SEARCH  (text + visual)")
-    print(f"  α={alpha:.2f}  (text) + {1-alpha:.2f} (visual)")
+    beta = 1.0 - alpha   # visual weight; audio weight = 1 - alpha - beta
+    print("\n" + "=" * 70)
+    print("  TRI-ENCODER SIMILARITY SEARCH  (text + visual + audio)")
+    print(f"  α={alpha:.2f} (text)  β={beta:.2f} (visual)  γ={max(0, 1-alpha-beta):.2f} (audio)")
     print("  Enter any title, name, or description to search.")
-    print("  Commands: 'quit' · 'list' · 'alpha <value>'")
-    print("=" * 65)
+    print("  Commands: 'quit' · 'list' · 'alpha <value>' · 'beta <value>'")
+    print("=" * 70)
 
     while True:
         try:
@@ -731,9 +774,18 @@ def interactive_search(
             try:
                 alpha = float(raw.split()[1])
                 alpha = max(0.0, min(1.0, alpha))
-                print(f"  α set to {alpha:.2f}  (text={alpha:.2f} · visual={1-alpha:.2f})")
+                beta  = max(0.0, min(1.0 - alpha, beta))
+                print(f"  α={alpha:.2f} (text)  β={beta:.2f} (visual)  γ={max(0, 1-alpha-beta):.2f} (audio)")
             except (IndexError, ValueError):
                 print("  Usage: alpha <0.0 – 1.0>")
+            continue
+        if raw.lower().startswith("beta "):
+            try:
+                beta = float(raw.split()[1])
+                beta = max(0.0, min(1.0 - alpha, beta))
+                print(f"  α={alpha:.2f} (text)  β={beta:.2f} (visual)  γ={max(0, 1-alpha-beta):.2f} (audio)")
+            except (IndexError, ValueError):
+                print("  Usage: beta <0.0 – 1.0>")
             continue
 
         print("  Encoding query …")
@@ -746,22 +798,29 @@ def interactive_search(
         v_vec = encode_query_visual(raw).reshape(1, -1)               # (1, 768)
         visual_scores, visual_idxs = visual_index.search(v_vec, len(titles))
 
-        # ── Combine scores ────────────────────────────────────────────────
-        # Map each title index → its score in each sub-space
-        text_score_map   = {int(idx): float(s) for idx, s in zip(text_idxs[0],   text_scores[0])}
-        visual_score_map = {int(idx): float(s) for idx, s in zip(visual_idxs[0], visual_scores[0])}
+        # ── Audio sub-space query (CLAP text encoder) ─────────────────────
+        a_vec = encode_query_audio(raw).reshape(1, -1)                # (1, 512)
+        audio_scores, audio_idxs = audio_index.search(a_vec, len(titles))
 
+        # ── Combine scores ────────────────────────────────────────────────
+        text_score_map  = {int(idx): float(s) for idx, s in zip(text_idxs[0],   text_scores[0])}
+        visual_score_map= {int(idx): float(s) for idx, s in zip(visual_idxs[0], visual_scores[0])}
+        audio_score_map = {int(idx): float(s) for idx, s in zip(audio_idxs[0],  audio_scores[0])}
+
+        gamma = max(0.0, 1.0 - alpha - beta)
         combined = {
-            i: alpha * text_score_map.get(i, 0.0) + (1 - alpha) * visual_score_map.get(i, 0.0)
+            i: alpha  * text_score_map.get(i,   0.0)
+             + beta   * visual_score_map.get(i,  0.0)
+             + gamma  * audio_score_map.get(i,   0.0)
             for i in range(len(titles))
         }
         ranked = sorted(combined.items(), key=lambda x: x[1], reverse=True)[:k]
 
         # ── Display results ───────────────────────────────────────────────
-        print(f"\n  Query  →  «{raw}»  [α={alpha:.2f} text · {1-alpha:.2f} visual]")
-        print("  " + "-" * 65)
-        print(f"  {'#':<4} {'score':<8} {'T-score':<8} {'V-score':<8}  title")
-        print("  " + "-" * 65)
+        print(f"\n  Query  →  «{raw}»  [α={alpha:.2f} text · β={beta:.2f} visual · γ={gamma:.2f} audio]")
+        print("  " + "-" * 75)
+        print(f"  {'#':<4} {'score':<8} {'T-score':<8} {'V-score':<8} {'A-score':<8}  title")
+        print("  " + "-" * 75)
         for rank, (idx, score) in enumerate(ranked, 1):
             t = titles[idx]
             visual_flag = "🖼" if int(t["id"]) in _visual_coverage else "  "
@@ -769,27 +828,32 @@ def interactive_search(
                 f"  {rank:<4} {score:<8.4f} "
                 f"{text_score_map.get(idx, 0):<8.4f} "
                 f"{visual_score_map.get(idx, 0):<8.4f} "
+                f"{audio_score_map.get(idx, 0):<8.4f} "
                 f"{visual_flag} {t['title'][:40]:<40} "
                 f"{t.get('type','?'):12} {t.get('year','?')}"
             )
 
         # ── UMAP: project query into the embedding space and save HTML ────
         if HAS_UMAP and HAS_PLOTLY:
-            # Build a full 1693-dim query vector: text + visual sub-vecs, zeros elsewhere
+            # Build a full 1693-dim query vector: text + visual + audio sub-vecs
             query_full = np.zeros(TOTAL_DIM, dtype=np.float32)
             query_full[TEXT_SLICE]   = t_vec.flatten()
             query_full[VISUAL_SLICE] = v_vec.flatten()
+            query_full[AUDIO_SLICE]  = a_vec.flatten()
             norm = np.linalg.norm(query_full)
             if norm > 0:
                 query_full /= norm
 
+            result_idxs = [(rank, idx, score) for rank, (idx, score) in enumerate(ranked, 1)]
             safe_name = "".join(c if c.isalnum() else "_" for c in raw)[:40]
             umap_out_3d = UMAP_3D_DIR / f"umap_query_{safe_name}.html"
             visualise(vectors, titles, out_path=umap_out_3d,
-                      query_vec=query_full, query_label=raw)
+                      query_vec=query_full, query_label=raw,
+                      result_idxs=result_idxs)
             umap_out_2d = UMAP_2D_DIR / f"umap_query_{safe_name}.png"
             visualise_2d(vectors, titles, out_path=umap_out_2d,
-                         query_vec=query_full, query_label=raw)
+                         query_vec=query_full, query_label=raw,
+                         result_idxs=result_idxs)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -802,7 +866,9 @@ def visualise(
     out_path: Path = UMAP_PATH,
     query_vec: np.ndarray | None = None,
     query_label: str = "Query",
+    result_idxs: list[tuple[int, int, float]] | None = None,
 ) -> None:
+    # result_idxs: list of (rank, corpus_idx, score) for the top-k hits
     if not HAS_UMAP:
         print("  umap-learn not installed — skipping visualisation.  (pip install umap-learn)")
         return
@@ -856,6 +922,27 @@ def visualise(
             marker=dict(size=5, color=type_color[tp], opacity=0.75),
         ))
 
+    # ── top-k result highlights ───────────────────────────────────────────
+    if result_idxs:
+        res_x, res_y, res_z, res_text = [], [], [], []
+        for rank, idx, score in result_idxs:
+            res_x.append(corpus_emb[idx, 0])
+            res_y.append(corpus_emb[idx, 1])
+            res_z.append(corpus_emb[idx, 2])
+            res_text.append(f"#{rank} {titles[idx]['title'][:30]} ({score:.3f})")
+        traces.append(go.Scatter3d(
+            x=res_x, y=res_y, z=res_z,
+            mode="markers+text",
+            name="Results",
+            text=res_text,
+            textposition="top center",
+            textfont=dict(size=10, color="gold"),
+            marker=dict(
+                size=9, color="gold", symbol="circle",
+                line=dict(color="black", width=2),
+            ),
+        ))
+
     # ── query point ───────────────────────────────────────────────────────
     if query_emb is not None:
         traces.append(go.Scatter3d(
@@ -897,7 +984,9 @@ def visualise_2d(
     out_path: Path = UMAP_2D_DIR / "umap_titles.png",
     query_vec: np.ndarray | None = None,
     query_label: str = "Query",
+    result_idxs: list[tuple[int, int, float]] | None = None,
 ) -> None:
+    # result_idxs: list of (rank, corpus_idx, score) for the top-k hits
     if not HAS_UMAP:
         print("  umap-learn not installed — skipping 2D visualisation.  (pip install umap-learn)")
         return
@@ -943,6 +1032,22 @@ def visualise_2d(
                 (corpus_emb[i, 0], corpus_emb[i, 1]),
                 fontsize=5, alpha=0.6,
             )
+
+    if result_idxs:
+        for rank, idx, score in result_idxs:
+            ax.scatter(
+                corpus_emb[idx, 0], corpus_emb[idx, 1],
+                c="gold", s=100, marker="*", zorder=4,
+                edgecolors="black", linewidths=0.8,
+            )
+            ax.annotate(
+                f"#{rank} {titles[idx]['title'][:25]}",
+                (corpus_emb[idx, 0], corpus_emb[idx, 1]),
+                fontsize=7, color="darkorange", fontweight="bold",
+                xytext=(4, 4), textcoords="offset points",
+            )
+        ax.scatter([], [], c="gold", s=100, marker="*",
+                   edgecolors="black", linewidths=0.8, label="Results")
 
     if query_emb is not None:
         ax.scatter(
@@ -1013,7 +1118,7 @@ def main() -> None:
 
     if args.rebuild:
         from extract_audio import extract_missing_audio
-        print("Extracting audio from HLS clips …")
+        print("Extracting audio (music videos via yt-dlp) …")
         extract_missing_audio(titles, out_dir=AUDIO_DIR)
 
     wav_available = sum(1 for c in cuid2s if (AUDIO_DIR / f"{c}.wav").exists())
@@ -1021,7 +1126,7 @@ def main() -> None:
         print("  No WAV files available — audio modality will be zeros.")
         audio_map: dict[str, np.ndarray] = {}
     else:
-        print(f"Building audio embeddings (Whisper {WHISPER_MODEL_ID}) …")
+        print(f"Building audio embeddings (CLAP {CLAP_MODEL_ID}) …")
         print(f"  {wav_available}/{len(titles)} WAV files available.")
         audio_map = build_audio_map(cuid2s)
 

@@ -23,7 +23,7 @@ Each sub-vector is L2-normalised individually before concatenation. The final fu
 | File | Role |
 |---|---|
 | `title_vectors.py` | Main script — builds vectors, FAISS index, interactive search + per-query UMAP |
-| `db.py` | Database clients (PostgreSQL via SQLAlchemy, Qdrant) |
+| `db.py` | Database clients (PostgreSQL via SQLAlchemy, Qdrant) — **gitignored, recreate locally** |
 | `extract_audio.py` | Extracts 16kHz mono WAV files from HLS streams via ffmpeg (called on `--rebuild`) |
 
 ---
@@ -58,6 +58,7 @@ Core packages used:
 | `llama-index-core` | `SentenceSplitter` for text chunking |
 | `umap-learn` | Dimensionality reduction for per-query visualisation (optional) |
 | `plotly` | Interactive 3D UMAP HTML output (optional, required alongside umap-learn) |
+| `matplotlib` | Static 2D UMAP PNG output (optional, required alongside umap-learn) |
 | `python-dotenv` | Environment variable loading |
 | `tqdm` | Progress bars |
 
@@ -67,14 +68,20 @@ Create a `.env` file in the project root:
 
 ```env
 DATABASE_URL=postgresql://user:password@host:5432/dbname
+
 QDRANT_ENDPOINT=https://your-qdrant-instance
 QDRANT_API_KEY=your-api-key
 
-# Optional — override default Qdrant collection names
-QDRANT_STILLS_COLLECTION=media_items
+# Qdrant collection names — all required, no defaults
+QDRANT_STILLS_COLLECTION=
+QDRANT_VIDEOS_COLLECTION=
+QDRANT_EFFECTS_COLLECTION=
+QDRANT_PERSONS_COLLECTION=
+QDRANT_PREDICT_COLLECTION=
+QDRANT_TREATMENTS_COLLECTION=
 
-# Optional — CDN base for b2:// → HTTP URL conversion (used by extract_audio.py)
-CDN_BASE=https://cdn.genery.online/file/
+# CDN base for b2:// → HTTP URL conversion (used by extract_audio.py)
+CDN_BASE=https://your-cdn-base/file/
 ```
 
 ---
@@ -102,7 +109,7 @@ python title_vectors.py --rebuild         # force rebuild and re-extract missing
 
 **What it does:**
 
-1. Fetches titles from PostgreSQL ordered by popularity
+1. Fetches titles from PostgreSQL — one-third movies, one-third TV series, one-third music videos, each ordered by popularity within their type
 2. Fetches SigLIP2 visual vectors from Qdrant (top 50 stills per title, averaged then re-normalised to unit length)
 3. Fetches cast & crew from `title_persons` / `persons` (up to 20 per title, directors first)
 4. Extracts and encodes audio with the Whisper encoder (if WAV files exist in `./audio/`)
@@ -159,7 +166,11 @@ Search: quit
 
 Results display the combined score, individual text and visual sub-scores, and a flag for titles that have Qdrant image vectors.
 
-After each query, a 3D interactive UMAP visualisation is generated and saved as `umap_query_<query>.html`. The corpus titles are plotted and coloured by title type; the query is placed in the same space and shown as a red diamond, so you can see which region of the embedding space the query lands in relative to the titles.
+After each query, UMAP visualisations are generated and saved:
+- `3d_umaps/umap_query_<query>.html` — interactive 3D Plotly plot
+- `2d_umaps/umap_query_<query>.png` — static 2D matplotlib plot
+
+In both, corpus titles are coloured by type, top-k results are highlighted in gold with rank labels, and the query is shown as a red diamond.
 
 ---
 
@@ -182,4 +193,5 @@ After each query, a 3D interactive UMAP visualisation is generated and saved as 
 | `title_vectors.npy` | Raw `(N, 1693)` float32 vector matrix |
 | `title_index.faiss` | Persisted FAISS `IndexFlatIP` |
 | `title_meta.json` | Title metadata aligned to FAISS index positions |
-| `umap_query_<query>.html` | Per-query interactive 3D UMAP plot (corpus + query point) |
+| `3d_umaps/umap_query_<query>.html` | Per-query interactive 3D UMAP plot (corpus + query + top-k results) |
+| `2d_umaps/umap_query_<query>.png` | Per-query static 2D UMAP plot (corpus + query + top-k results) |

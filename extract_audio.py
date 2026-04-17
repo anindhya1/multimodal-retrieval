@@ -3,15 +3,14 @@ extract_audio.py
 ================
 Extracts audio from video clips associated with titles in the Genery DB.
 
-How it works:
-  1. Fetches titles + their top media item (by aesthetic_score) from Postgres
-  2. Reads the HLS URL from media_items.file_path → scene → hls
-  3. Converts b2:// storage URLs → CDN HTTP URLs
-  4. Uses ffmpeg to download the HLS stream and extract audio as 16kHz mono WAV
-  5. Saves one WAV file per title into the output directory
+Two extraction paths depending on title type:
 
-URL conversion:
-  b2://genery-media-items/scene/...  →  {CDN_BASE}genery-media-items/scene/...
+  musicVideo  — fetches YouTube/Vimeo URL from titles.foreign_links and
+                downloads audio with yt-dlp, converted to 16kHz mono WAV.
+
+  movie /     — fetches the best media item (by aesthetic_score) from
+  tvSeries      media_items, converts b2:// → CDN HTTP URL, and extracts
+                audio from the HLS stream via ffmpeg.
 
 Output:
   audio/<title_cuid2>.wav
@@ -175,6 +174,43 @@ def fetch_hls_map(title_ids: list[int]) -> dict[str, str]:
     return result
 
 
+def fetch_foreign_links_map(title_ids: list[int]) -> dict[str, str]:
+    """
+    Return {cuid2: url} for music video titles, preferring YouTube over Vimeo.
+    Reads titles.foreign_links JSON column, e.g.:
+      {"youtube": "https://...", "vimeo": "https://..."}
+    """
+    if not title_ids:
+        return {}
+
+    sql = text("""
+        SELECT cuid2, foreign_links
+        FROM titles
+        WHERE id = ANY(:ids)
+          AND type = 'musicVideo'
+          AND deleted_at IS NULL
+          AND foreign_links IS NOT NULL
+    """)
+    with pg.connect() as conn:
+        rows = conn.execute(sql, {"ids": title_ids}).mappings().fetchall()
+
+    result: dict[str, str] = {}
+    for row in rows:
+        fl = row["foreign_links"]
+        if isinstance(fl, str):
+            try:
+                fl = json.loads(fl)
+            except json.JSONDecodeError:
+                continue
+        if not isinstance(fl, dict):
+            continue
+        url = fl.get("youtube") or fl.get("vimeo")
+        if url:
+            result[row["cuid2"]] = url
+
+    return result
+
+
 def extract_missing_audio(
     titles: list[dict],
     out_dir: Path = Path("audio"),
@@ -201,19 +237,29 @@ def extract_missing_audio(
 
     print(f"  {already} WAV files already exist. Extracting {len(missing)} missing …")
 
-    hls_map = fetch_hls_map([int(t["id"]) for t in missing])
-    no_hls  = sum(1 for t in missing if t["cuid2"] not in hls_map)
-    if no_hls:
-        print(f"  ⚠  {no_hls}/{len(missing)} titles have no HLS URL — will be skipped.")
+    music_missing = [t for t in missing if t.get("type") == "musicVideo"]
+    hls_missing   = [t for t in missing if t.get("type") != "musicVideo"]
+
+    # ── YouTube/Vimeo map for music videos only ───────────────────────────
+    foreign_map = fetch_foreign_links_map([int(t["id"]) for t in music_missing])
+    no_foreign  = sum(1 for t in music_missing if t["cuid2"] not in foreign_map)
+
+    if hls_missing:
+        print(f"  ℹ  Skipping audio for {len(hls_missing)} movies/TV series (HLS unavailable).")
+    if no_foreign:
+        print(f"  ⚠  {no_foreign}/{len(music_missing)} music videos have no YouTube/Vimeo URL — will be skipped.")
 
     success, failed = 0, 0
-    for t in tqdm(missing, unit="title"):
-        cuid2   = t["cuid2"]
-        hls_url = hls_map.get(cuid2)
-        if not hls_url:
+    for t in tqdm(music_missing, unit="title"):
+        cuid2      = t["cuid2"]
+        out_path   = out_dir / f"{cuid2}.wav"
+        title_name = t.get("title") or t.get("title_name") or cuid2
+
+        url = foreign_map.get(cuid2)
+        if not url:
             continue
-        out_path = out_dir / f"{cuid2}.wav"
-        ok, err  = extract_audio(hls_url, out_path, timeout=timeout)
+        ok, err = extract_audio_ytdlp(url, out_path, timeout=timeout)
+
         if ok:
             success += 1
         else:
@@ -221,10 +267,9 @@ def extract_missing_audio(
             if out_path.exists():
                 out_path.unlink()
             if err:
-                title_name = t.get("title") or t.get("title_name") or cuid2
                 print(f"  ✗  {title_name[:40]}: {err}")
 
-    print(f"  Audio extraction — {success} ok · {failed} failed · {no_hls} no HLS")
+    print(f"  Audio extraction — {success} ok · {failed} failed · {no_foreign} no source")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -303,6 +348,50 @@ def extract_audio(hls_url: str, out_path: Path, timeout: int = FFMPEG_TIMEOUT) -
         return False, f"timed out after {timeout}s"
     except FileNotFoundError:
         sys.exit("ffmpeg not found — please install it (brew install ffmpeg)")
+
+
+def extract_audio_ytdlp(
+    url: str,
+    out_path: Path,
+    timeout: int = FFMPEG_TIMEOUT,
+) -> tuple[bool, str | None]:
+    """
+    Download audio from a YouTube or Vimeo URL using yt-dlp and save as
+    a 16kHz mono WAV file.
+
+    yt-dlp command:
+      yt-dlp -x                        # extract audio only
+             --audio-format wav        # output format
+             --postprocessor-args "-ar 16000 -ac 1"  # resample via ffmpeg
+             -o <out_path>
+             <url>
+
+    Returns (True, None) on success, (False, error_message) on failure.
+    """
+    cmd = [
+        "yt-dlp",
+        "-x",
+        "--audio-format", "wav",
+        "--postprocessor-args", f"ffmpeg:-ar {AUDIO_SAMPLE_RATE} -ac {AUDIO_CHANNELS}",
+        "--no-playlist",
+        "-o", str(out_path),
+        url,
+    ]
+
+    try:
+        result = subprocess.run(
+            cmd,
+            timeout=timeout,
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            return False, result.stderr.strip().splitlines()[-1] if result.stderr.strip() else "unknown error"
+        return True, None
+    except subprocess.TimeoutExpired:
+        return False, f"timed out after {timeout}s"
+    except FileNotFoundError:
+        sys.exit("yt-dlp not found — please install it (pip install yt-dlp)")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
