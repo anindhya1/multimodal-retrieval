@@ -44,7 +44,7 @@ load_dotenv()
 # Config
 # ──────────────────────────────────────────────────────────────────────────────
 
-CDN_BASE       = os.environ.get("CDN_BASE", "https://cdn.genery.online/file/")
+CDN_BASE       = os.environ["CDN_BASE"]
 B2_SCHEME      = "b2://"
 
 AUDIO_SAMPLE_RATE = 16000   # Hz  — 16kHz is standard for speech/audio models
