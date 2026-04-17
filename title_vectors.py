@@ -522,12 +522,12 @@ def build_audio_map(cuid2s: list[str]) -> dict[str, np.ndarray]:
             sr, audio = wav_io.read(str(wav_path))
             if audio.ndim > 1:
                 audio = audio.mean(axis=1)           # stereo → mono
-            audio = audio.astype(np.float32)
-            if audio.max() > 1.0:
-                audio /= 32768.0                     # int16 → float32 [-1, 1]
             if sr != CLAP_SR:
                 num_samples = int(len(audio) * CLAP_SR / sr)
                 audio = sig_resample.resample(audio, num_samples)
+            audio = audio.astype(np.float32)
+            if audio.max() > 1.0:
+                audio /= 32768.0                     # int16 → float32 [-1, 1]
             inputs = _clap_processor(
                 audio=audio, sampling_rate=CLAP_SR, return_tensors="pt"
             )
