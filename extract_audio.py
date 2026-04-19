@@ -46,7 +46,7 @@ load_dotenv()
 CDN_BASE       = os.environ["CDN_BASE"]
 B2_SCHEME      = "b2://"
 
-AUDIO_SAMPLE_RATE = 16000   # Hz  — 16kHz is standard for speech/audio models
+AUDIO_SAMPLE_RATE = 48000   # Hz  — 48kHz required by CLAP
 AUDIO_CHANNELS    = 1       # mono
 FFMPEG_TIMEOUT    = 120     # seconds per clip before giving up
 

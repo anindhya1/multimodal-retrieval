@@ -1,24 +1,31 @@
 """
-title_vectors.py
-================
-Builds one fixed-dimension vector per title from the Genery database,
-indexes them in FAISS, and demonstrates similarity search + UMAP visualisation.
+fused_search.py
+===============
+Fully-fused multimodal similarity search over the Genery title embedding index,
+backed by Qdrant for filtered nearest-neighbour search.
 
-Vector layout  (1 693 dims, L2-normalised → cosine-equivalent search)
+Vector layout  (1 664 dims, L2-normalised → cosine-equivalent search)
   [    0 :  384 ]  text     – mean-pooled all-MiniLM-L6-v2 on title+desc+genres+keywords+cast
-  [  384 : 1152 ]  visual   – mean of SigLIP2 ViT-B vectors fetched from Qdrant (zeros if none)
+  [  384 : 1152 ]  visual   – mean of SigLIP2 ViT-B (siglip-768) vectors from Qdrant
   [ 1152 : 1664 ]  audio    – CLAP larger_clap_general audio encoder (zeros if no WAV)
-  [ 1664 : 1693 ]  metadata – year · popularity · imdb_rating · is_adult
-                              type one-hot (×5) · genre multi-hot (×20)
+
+Metadata (type, year, genres, popularity, imdb_rating, is_adult) is stored as
+Qdrant payload alongside each vector — not baked into the vector itself.
+
+At query time:
+  1. Infer the media type of the query title via a text sub-vector lookup in
+     Qdrant (strong match → use its type; fallback → majority vote; else no filter)
+  2. Build a 1664-dim fused query vector using the same three encoders
+  3. Search Qdrant with the fused vector and the inferred type filter
 
 Usage
 -----
-  python title_vectors.py            # 100 titles (default)
-  python title_vectors.py --limit 300
-  python title_vectors.py --rebuild  # force rebuild even if cache exists
+  python fused_search.py            # 100 titles (default)
+  python fused_search.py --limit 300
+  python fused_search.py --rebuild  # force rebuild + re-upload to Qdrant
 
 Audio pre-requisite:
-  Run extract_audio.py first to populate the ./audio/ directory with WAV files.
+  Run extract_audio.py first to populate ./audio/ with WAV files.
   Titles without a WAV file get a zero audio sub-vector.
 """
 
@@ -29,12 +36,10 @@ os.environ["MKL_NUM_THREADS"]        = "1"
 
 import argparse
 import json
-import math
 import re
 import sys
 from pathlib import Path
 
-import faiss
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -85,13 +90,21 @@ from db import pg, qdrant, Collections
 # Config
 # ──────────────────────────────────────────────────────────────────────────────
 
-TEXT_DIM    = 384
-VISUAL_DIM  = 768    # SigLIP2 ViT-B (Base) vectors stored in Qdrant STILLS collection
-AUDIO_DIM   = 512    # CLAP larger_clap_general audio embedding
-META_DIM    = 29     # breakdown: see encode_metadata
-TOTAL_DIM   = TEXT_DIM + VISUAL_DIM + AUDIO_DIM + META_DIM   # 1 693
+TEXT_DIM   = 384
+VISUAL_DIM = 768   # SigLIP2 ViT-B (Base) vectors stored in Qdrant STILLS collection
+AUDIO_DIM  = 512   # CLAP larger_clap_general audio embedding
+TOTAL_DIM  = TEXT_DIM + VISUAL_DIM + AUDIO_DIM   # 1 664
 
 QDRANT_VECTOR_NAME = "siglip-768"
+
+# Qdrant collection for fused title vectors + payload
+_title_coll_env = "QDRANT_TITLE_EMBEDDINGS_COLLECTION"
+TITLE_COLLECTION = os.environ.get(_title_coll_env)
+if not TITLE_COLLECTION:
+    raise RuntimeError(f"Missing required environment variable: {_title_coll_env}")
+
+# Minimum text similarity score to consider a title found in the index
+TYPE_INFER_THRESHOLD = 0.85
 
 TEXT_MODEL_ID    = "sentence-transformers/all-MiniLM-L6-v2"
 TEXT_MAX_LEN     = 256   # max tokens per chunk fed to the transformer
@@ -102,27 +115,13 @@ SIGLIP2_MODEL_ID  = "google/siglip2-base-patch16-224"
 CLAP_MODEL_ID     = "laion/larger_clap_general"   # CLAP → 512-dim shared text-audio space
 AUDIO_DIR         = Path("audio")   # where extract_audio.py saves WAV files
 
-# Vector slice boundaries
+# Vector slice boundaries (metadata removed — lives in Qdrant payload instead)
 TEXT_SLICE   = slice(0,    384)    # all-MiniLM text sub-space
 VISUAL_SLICE = slice(384,  1152)   # SigLIP2 visual sub-space
 AUDIO_SLICE  = slice(1152, 1664)   # CLAP audio sub-space
-META_SLICE   = slice(1664, 1693)   # metadata
-
-# Query-time score combination weight
-SEARCH_ALPHA = 0.5
 
 YEAR_MIN, YEAR_MAX = 1900, 2025
 
-KNOWN_TYPES = ["movie", "tvSeries", "tvEpisode", "musicVideo", "commercial"]
-
-KNOWN_GENRES = [
-    "Action", "Adventure", "Animation", "Comedy", "Crime",
-    "Documentary", "Drama", "Fantasy", "Horror", "Music",
-    "Mystery", "Romance", "Science Fiction", "Thriller", "Western",
-    "Family", "Biography", "History", "Sport", "War",
-]
-
-INDEX_PATH   = Path("title_index.faiss")
 META_PATH    = Path("title_meta.json")
 VECTORS_PATH = Path("title_vectors.npy")
 UMAP_2D_DIR  = Path("2d_umaps")
@@ -575,68 +574,6 @@ def encode_visual(title_id: int, visual_map: dict[int, np.ndarray]) -> np.ndarra
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 5.  Metadata encoder
-# ──────────────────────────────────────────────────────────────────────────────
-
-def encode_metadata(row: dict) -> np.ndarray:
-    """
-    29-dim structured feature vector (all values in [0, 1]):
-      [0]      year          – normalised to [YEAR_MIN, YEAR_MAX]
-      [1]      popularity    – log-scaled, normalised
-      [2]      imdb_rating   – /10
-      [3]      is_adult      – binary
-      [4:9]    type          – one-hot over KNOWN_TYPES (5 dims)
-      [9:29]   genres        – multi-hot over KNOWN_GENRES (20 dims)
-    """
-    vec = np.zeros(META_DIM, dtype=np.float32)
-
-    # year
-    year = row.get("year")
-    if year:
-        vec[0] = float(np.clip((int(year) - YEAR_MIN) / (YEAR_MAX - YEAR_MIN), 0.0, 1.0))
-
-    # popularity (log scale; cap at log(1001) ≈ 7)
-    pop = row.get("popularity")
-    if pop and pop > 0:
-        vec[1] = float(np.clip(math.log1p(float(pop)) / math.log1p(1000), 0.0, 1.0))
-
-    # imdb rating
-    ratings = row.get("ratings")
-    if ratings:
-        if isinstance(ratings, str):
-            try:
-                ratings = json.loads(ratings)
-            except json.JSONDecodeError:
-                ratings = {}
-        if isinstance(ratings, dict):
-            imdb_rating = (ratings.get("imdb") or {}).get("rating")
-            if imdb_rating is not None:
-                vec[2] = float(np.clip(float(imdb_rating) / 10.0, 0.0, 1.0))
-
-    # is_adult
-    vec[3] = 1.0 if row.get("is_adult") else 0.0
-
-    # type one-hot
-    title_type = (row.get("type") or "").strip()
-    if title_type in KNOWN_TYPES:
-        vec[4 + KNOWN_TYPES.index(title_type)] = 1.0
-
-    # genre multi-hot
-    genres = row.get("genres") or []
-    if isinstance(genres, str):
-        try:
-            genres = json.loads(genres)
-        except json.JSONDecodeError:
-            genres = []
-    for g in genres:
-        g_stripped = g.strip()
-        if g_stripped in KNOWN_GENRES:
-            vec[9 + KNOWN_GENRES.index(g_stripped)] = 1.0
-
-    return vec
-
-
-# ──────────────────────────────────────────────────────────────────────────────
 # 6.  Fusion
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -657,94 +594,185 @@ def build_title_vector(
     L2-normalise the fused result.
     Missing modalities (no WAV, no Qdrant vector) contribute zero sub-vectors,
     so the final norm is driven by whichever modalities are present.
+
+    Metadata (type, year, genres, etc.) is no longer baked into the vector —
+    it is stored as Qdrant payload alongside the vector instead.
     """
     persons = persons_map.get(int(row["id"]))
-    t_vec = _l2_normalise(encode_text(row, persons))       # (384,)
-    v_vec = _l2_normalise(encode_visual(row["id"], visual_map))  # (768,)
-    a_vec = _l2_normalise(encode_audio(row["cuid2"], audio_map)) # (512,)
-    m_vec = _l2_normalise(encode_metadata(row))            # ( 29,)
-    fused = np.concatenate([t_vec, v_vec, a_vec, m_vec])   # (1693,)
-    norm  = np.linalg.norm(fused)
-    return (fused / norm).astype(np.float32) if norm > 0 else fused.astype(np.float32)
+    t_vec = _l2_normalise(encode_text(row, persons))              # (384,)
+    v_vec = _l2_normalise(encode_visual(row["id"], visual_map))   # (768,)
+    a_vec = _l2_normalise(encode_audio(row["cuid2"], audio_map))  # (512,)
+    fused = np.concatenate([t_vec, v_vec, a_vec])                 # (1664,)
+    return _l2_normalise(fused)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 7.  FAISS index
+# 7.  Qdrant title collection — upload and type inference
 # ──────────────────────────────────────────────────────────────────────────────
 
-def build_index(vectors: np.ndarray) -> faiss.IndexFlatIP:
+def ensure_title_collection() -> None:
     """
-    IndexFlatIP (inner product) on L2-normalised vectors is equivalent to
-    cosine similarity — exact nearest-neighbour, no approximation.
+    Create the Qdrant title embeddings collection if it does not already exist.
+    Each point stores two named vectors:
+      'fused' (1664-dim) — for similarity search
+      'text'  ( 384-dim) — for type inference lookup
+
+    A keyword payload index is created on 'type' so Qdrant can filter by it
+    efficiently (Qdrant requires an index on any filtered field).
     """
-    index = faiss.IndexFlatIP(TOTAL_DIM)
-    index.add(vectors)
-    return index
+    from qdrant_client.models import VectorParams, Distance, PayloadSchemaType
+
+    existing = {c.name for c in qdrant.get_collections().collections}
+    if TITLE_COLLECTION not in existing:
+        qdrant.create_collection(
+            collection_name=TITLE_COLLECTION,
+            vectors_config={
+                "fused": VectorParams(size=TOTAL_DIM, distance=Distance.COSINE),
+                "text":  VectorParams(size=TEXT_DIM,  distance=Distance.COSINE),
+            },
+        )
+        print(f"  Created Qdrant collection '{TITLE_COLLECTION}'.")
+    else:
+        print(f"  Qdrant collection '{TITLE_COLLECTION}' already exists.")
+
+    # Always ensure the keyword index on 'type' exists (idempotent)
+    qdrant.create_payload_index(
+        collection_name=TITLE_COLLECTION,
+        field_name="type",
+        field_schema=PayloadSchemaType.KEYWORD,
+    )
+    print(f"  Payload index on 'type' ensured.")
 
 
-def build_sub_indices(
-    vectors: np.ndarray,
-) -> tuple[faiss.IndexFlatIP, faiss.IndexFlatIP, faiss.IndexFlatIP]:
+def upload_title_vectors(titles: list[dict], vectors: np.ndarray) -> None:
     """
-    Build three separate FAISS indices from sub-slices of the full vector:
-      - text_index  : vectors[:, TEXT_SLICE]   (384-dim, all-MiniLM space)
-      - visual_index: vectors[:, VISUAL_SLICE] (768-dim, SigLIP2 space)
-      - audio_index : vectors[:, AUDIO_SLICE]  (512-dim, Whisper encoder space)
+    Upload fused title vectors to Qdrant with structured payload.
 
-    Each sub-slice is L2-normalised independently so inner product = cosine.
-    Note: audio_index is built for completeness; interactive_search only queries
-    text and visual sub-spaces since there is no text→audio encoder.
+    Payload fields per point:
+      title_id, cuid2, title, type, year, popularity,
+      imdb_rating, is_adult, genres
+
+    Point ID = index position in the titles list, so Qdrant result IDs map
+    directly back to indices in the local `vectors` numpy array for UMAP.
     """
-    def _normalise(mat: np.ndarray) -> np.ndarray:
-        norms = np.linalg.norm(mat, axis=1, keepdims=True)
-        norms = np.where(norms == 0, 1.0, norms)
-        return (mat / norms).astype(np.float32)
+    from qdrant_client.models import PointStruct
 
-    text_vecs   = _normalise(vectors[:, TEXT_SLICE])
-    visual_vecs = _normalise(vectors[:, VISUAL_SLICE])
-    audio_vecs  = _normalise(vectors[:, AUDIO_SLICE])
+    points = []
+    for i, (row, vec) in enumerate(zip(titles, vectors)):
+        ratings = row.get("ratings") or {}
+        if isinstance(ratings, str):
+            try:
+                ratings = json.loads(ratings)
+            except json.JSONDecodeError:
+                ratings = {}
+        imdb_rating = (ratings.get("imdb") or {}).get("rating") if isinstance(ratings, dict) else None
 
-    text_index   = faiss.IndexFlatIP(TEXT_DIM)
-    visual_index = faiss.IndexFlatIP(VISUAL_DIM)
-    audio_index  = faiss.IndexFlatIP(AUDIO_DIM)
-    text_index.add(text_vecs)
-    visual_index.add(visual_vecs)
-    audio_index.add(audio_vecs)
+        payload = {
+            "title_id":    int(row["id"]),
+            "cuid2":       row["cuid2"],
+            "title":       row["title"],
+            "type":        row.get("type"),
+            "year":        row.get("year"),
+            "popularity":  float(row["popularity"]) if row.get("popularity") else None,
+            "imdb_rating": float(imdb_rating) if imdb_rating is not None else None,
+            "is_adult":    bool(row.get("is_adult")),
+            "genres":      list(row.get("genres") or []),
+        }
 
-    return text_index, visual_index, audio_index
+        points.append(PointStruct(
+            id=i,
+            vector={
+                "fused": vec.tolist(),
+                "text":  vec[TEXT_SLICE].tolist(),
+            },
+            payload=payload,
+        ))
+
+    BATCH = 100
+    print(f"Uploading {len(points)} title vectors to Qdrant '{TITLE_COLLECTION}' …")
+    for i in tqdm(range(0, len(points), BATCH), unit="batch"):
+        qdrant.upsert(collection_name=TITLE_COLLECTION, points=points[i : i + BATCH])
+    print(f"  Done.")
+
+
+def infer_query_type(raw: str) -> str | None:
+    """
+    Infer the media type of a title query using the Qdrant title collection.
+
+    If the top text result scores ≥ TYPE_INFER_THRESHOLD, the title is
+    considered found in the index and its type is used as a filter.
+    Otherwise no filter is applied — it is safer to return unfiltered results
+    than to filter on a type inferred from a weak match.
+    """
+    t_vec = _l2_normalise(encode_query_text(raw))
+    response = qdrant.query_points(
+        collection_name=TITLE_COLLECTION,
+        query=t_vec.tolist(),
+        using="text",
+        limit=1,
+        with_payload=True,
+    )
+    results = response.points
+
+    if not results:
+        print("  Type inference: no results — no filter applied.")
+        return None
+
+    top = results[0]
+    if top.score >= TYPE_INFER_THRESHOLD:
+        inferred = top.payload.get("type")
+        print(f"  Type inferred: '{inferred}'  (score {top.score:.3f} ≥ {TYPE_INFER_THRESHOLD})")
+        return inferred
+
+    print(f"  Title not found in index (score {top.score:.3f} < {TYPE_INFER_THRESHOLD}) — no filter applied.")
+    return None
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 8.  Similarity search demo
+# 8.  Fully-fused similarity search
 # ──────────────────────────────────────────────────────────────────────────────
+
+def _build_query_vector(raw: str) -> np.ndarray:
+    """
+    Build a 1664-dim fused query vector using the same pipeline as title vectors:
+      1. all-MiniLM text encoding  → L2-normalise → TEXT_SLICE
+      2. SigLIP2 text encoding     → L2-normalise → VISUAL_SLICE
+      3. CLAP text encoding        → L2-normalise → AUDIO_SLICE
+      concatenate → 1664-dim → L2-normalise
+
+    No metadata slice — metadata lives in Qdrant payload and is applied as a
+    filter, not baked into the vector.
+    """
+    t_vec = _l2_normalise(encode_query_text(raw))    # (384,)
+    v_vec = _l2_normalise(encode_query_visual(raw))  # (768,)
+    a_vec = _l2_normalise(encode_query_audio(raw))   # (512,)
+    fused = np.concatenate([t_vec, v_vec, a_vec])    # (1664,)
+    return _l2_normalise(fused)
+
 
 def interactive_search(
-    text_index:   faiss.IndexFlatIP,
-    visual_index: faiss.IndexFlatIP,
-    audio_index:  faiss.IndexFlatIP,
     titles: list[dict],
     vectors: np.ndarray,
     k: int = 5,
-    alpha: float = SEARCH_ALPHA,
 ) -> None:
     """
-    Interactive tri-encoder search loop.
+    Interactive fully-fused search loop backed by Qdrant.
 
     For each query:
-      1. Encode with all-MiniLM  → search text sub-index   (384-dim)
-      2. Encode with SigLIP2     → search visual sub-index (768-dim)
-      3. Encode with CLAP        → search audio sub-index  (512-dim)
-      4. Combine: alpha * text_score + beta * visual_score + (1-alpha-beta) * audio_score
+      1. Infer media type from the Qdrant index (text lookup + majority vote fallback)
+      2. Build a 1664-dim fused query vector
+      3. Search Qdrant with the fused vector and an optional type filter
+      4. Display results with cosine similarity scores
 
-    The query does not need to exist in the indexed set.
-    Commands: 'quit' · 'list' · 'alpha <0-1>' · 'beta <0-1>'
+    Commands: 'quit' · 'list'
     """
-    beta = 1.0 - alpha   # visual weight; audio weight = 1 - alpha - beta
+    from qdrant_client.models import Filter, FieldCondition, MatchValue
+
     print("\n" + "=" * 70)
-    print("  TRI-ENCODER SIMILARITY SEARCH  (text + visual + audio)")
-    print(f"  α={alpha:.2f} (text)  β={beta:.2f} (visual)  γ={max(0, 1-alpha-beta):.2f} (audio)")
-    print("  Enter any title, name, or description to search.")
-    print("  Commands: 'quit' · 'list' · 'alpha <value>' · 'beta <value>'")
+    print("  FULLY-FUSED SIMILARITY SEARCH  (text + visual + audio)")
+    print("  Query is encoded into a single 1664-dim vector and searched")
+    print("  via Qdrant with automatic type filtering.")
+    print("  Commands: 'quit' · 'list'")
     print("=" * 70)
 
     while True:
@@ -764,81 +792,54 @@ def interactive_search(
             for i, t in enumerate(titles):
                 print(f"  {i+1:3}. {t['title'][:50]:<50}  {t.get('type','?'):12}  {t.get('year','?')}")
             continue
-        if raw.lower().startswith("alpha "):
-            try:
-                alpha = float(raw.split()[1])
-                alpha = max(0.0, min(1.0, alpha))
-                beta  = max(0.0, min(1.0 - alpha, beta))
-                print(f"  α={alpha:.2f} (text)  β={beta:.2f} (visual)  γ={max(0, 1-alpha-beta):.2f} (audio)")
-            except (IndexError, ValueError):
-                print("  Usage: alpha <0.0 – 1.0>")
-            continue
-        if raw.lower().startswith("beta "):
-            try:
-                beta = float(raw.split()[1])
-                beta = max(0.0, min(1.0 - alpha, beta))
-                print(f"  α={alpha:.2f} (text)  β={beta:.2f} (visual)  γ={max(0, 1-alpha-beta):.2f} (audio)")
-            except (IndexError, ValueError):
-                print("  Usage: beta <0.0 – 1.0>")
-            continue
 
         print("  Encoding query …")
 
-        # ── Text sub-space query (all-MiniLM) ────────────────────────────
-        t_vec = encode_query_text(raw).reshape(1, -1)                 # (1, 384)
-        text_scores, text_idxs = text_index.search(t_vec, len(titles))
+        # ── Step 1: infer type from Qdrant index ──────────────────────────
+        inferred_type = infer_query_type(raw)
 
-        # ── Visual sub-space query (SigLIP2 text encoder) ────────────────
-        v_vec = encode_query_visual(raw).reshape(1, -1)               # (1, 768)
-        visual_scores, visual_idxs = visual_index.search(v_vec, len(titles))
+        # ── Step 2: build fused query vector ─────────────────────────────
+        query_full = _build_query_vector(raw)   # (1664,) unit vector
 
-        # ── Audio sub-space query (CLAP text encoder) ─────────────────────
-        a_vec = encode_query_audio(raw).reshape(1, -1)                # (1, 512)
-        audio_scores, audio_idxs = audio_index.search(a_vec, len(titles))
-
-        # ── Combine scores ────────────────────────────────────────────────
-        text_score_map  = {int(idx): float(s) for idx, s in zip(text_idxs[0],   text_scores[0])}
-        visual_score_map= {int(idx): float(s) for idx, s in zip(visual_idxs[0], visual_scores[0])}
-        audio_score_map = {int(idx): float(s) for idx, s in zip(audio_idxs[0],  audio_scores[0])}
-
-        gamma = max(0.0, 1.0 - alpha - beta)
-        combined = {
-            i: alpha  * text_score_map.get(i,   0.0)
-             + beta   * visual_score_map.get(i,  0.0)
-             + gamma  * audio_score_map.get(i,   0.0)
-            for i in range(len(titles))
-        }
-        ranked = sorted(combined.items(), key=lambda x: x[1], reverse=True)[:k]
-
-        # ── Display results ───────────────────────────────────────────────
-        print(f"\n  Query  →  «{raw}»  [α={alpha:.2f} text · β={beta:.2f} visual · γ={gamma:.2f} audio]")
-        print("  " + "-" * 75)
-        print(f"  {'#':<4} {'score':<8} {'T-score':<8} {'V-score':<8} {'A-score':<8}  title")
-        print("  " + "-" * 75)
-        for rank, (idx, score) in enumerate(ranked, 1):
-            t = titles[idx]
-            visual_flag = "🖼" if int(t["id"]) in _visual_coverage else "  "
-            print(
-                f"  {rank:<4} {score:<8.4f} "
-                f"{text_score_map.get(idx, 0):<8.4f} "
-                f"{visual_score_map.get(idx, 0):<8.4f} "
-                f"{audio_score_map.get(idx, 0):<8.4f} "
-                f"{visual_flag} {t['title'][:40]:<40} "
-                f"{t.get('type','?'):12} {t.get('year','?')}"
+        # ── Step 3: Qdrant search with optional type filter ───────────────
+        search_filter = None
+        if inferred_type:
+            search_filter = Filter(
+                must=[FieldCondition(key="type", match=MatchValue(value=inferred_type))]
             )
 
-        # ── UMAP: project query into the embedding space and save HTML ────
-        if HAS_UMAP and HAS_PLOTLY:
-            # Build a full 1693-dim query vector: text + visual + audio sub-vecs
-            query_full = np.zeros(TOTAL_DIM, dtype=np.float32)
-            query_full[TEXT_SLICE]   = t_vec.flatten()
-            query_full[VISUAL_SLICE] = v_vec.flatten()
-            query_full[AUDIO_SLICE]  = a_vec.flatten()
-            norm = np.linalg.norm(query_full)
-            if norm > 0:
-                query_full /= norm
+        response = qdrant.query_points(
+            collection_name=TITLE_COLLECTION,
+            query=query_full.tolist(),
+            using="fused",
+            query_filter=search_filter,
+            limit=k,
+            with_payload=True,
+        )
 
-            result_idxs = [(rank, idx, score) for rank, (idx, score) in enumerate(ranked, 1)]
+        ranked = [
+            (rank, int(r.id), float(r.score), r.payload)
+            for rank, r in enumerate(response.points, 1)
+        ]
+
+        # ── Display results ───────────────────────────────────────────────
+        filter_label = f"  filter: type='{inferred_type}'" if inferred_type else "  no type filter"
+        print(f"\n  Query  →  «{raw}»  [{filter_label}]")
+        print("  " + "-" * 65)
+        print(f"  {'#':<4} {'cosine':<8}  title")
+        print("  " + "-" * 65)
+        for rank, idx, score, payload in ranked:
+            visual_flag = "🖼" if payload.get("title_id") in _visual_coverage else "  "
+            print(
+                f"  {rank:<4} {score:<8.4f}  "
+                f"{visual_flag} {(payload.get('title') or '')[:40]:<40} "
+                f"{payload.get('type', '?'):12} {payload.get('year', '?')}"
+            )
+
+        # ── UMAP: project query into the embedding space ──────────────────
+        if HAS_UMAP and HAS_PLOTLY:
+            # result idx = Qdrant point ID = index in vectors array
+            result_idxs = [(rank, idx, score) for rank, idx, score, _ in ranked]
             safe_name = "".join(c if c.isalnum() else "_" for c in raw)[:40]
             umap_out_3d = UMAP_3D_DIR / f"umap_query_{safe_name}.html"
             visualise(vectors, titles, out_path=umap_out_3d,
@@ -1124,10 +1125,9 @@ def main() -> None:
         print(f"  {wav_available}/{len(titles)} WAV files available.")
         audio_map = build_audio_map(cuid2s)
 
-    # ── 5. Build or load vectors ──────────────────────────────────────────
+    # ── 5. Build or load vectors, then upload to Qdrant ──────────────────
     cache_valid = (
-        INDEX_PATH.exists()
-        and META_PATH.exists()
+        META_PATH.exists()
         and VECTORS_PATH.exists()
         and not args.rebuild
     )
@@ -1135,33 +1135,28 @@ def main() -> None:
     if cache_valid:
         print(f"Loading cached vectors from {VECTORS_PATH} …")
         vectors = np.load(VECTORS_PATH)
-        print(f"Loading cached FAISS index from {INDEX_PATH} …")
-        index = faiss.read_index(str(INDEX_PATH))
         with open(META_PATH) as f:
             saved_meta = json.load(f)
-        # Reconcile: use DB titles but warn if counts differ
         if len(saved_meta) != len(titles):
             print(f"  ⚠  Cache has {len(saved_meta)} entries but DB returned {len(titles)}. "
                   "Run with --rebuild to refresh.")
+        print(f"  Assuming Qdrant collection '{TITLE_COLLECTION}' is already populated.")
+        print(f"  Run with --rebuild to force a re-upload.")
     else:
         # Build from scratch
         print(f"\nBuilding {len(titles)} title vectors  "
-              f"[text={TEXT_DIM}d · visual={VISUAL_DIM}d · audio={AUDIO_DIM}d · meta={META_DIM}d = {TOTAL_DIM}d] …")
+              f"[text={TEXT_DIM}d · visual={VISUAL_DIM}d · audio={AUDIO_DIM}d = {TOTAL_DIM}d] …")
         vectors_list: list[np.ndarray] = []
         for row in tqdm(titles, unit="title"):
             vectors_list.append(build_title_vector(row, visual_map, persons_map, audio_map))
-        vectors = np.stack(vectors_list)   # (N, 1693)
+        vectors = np.stack(vectors_list)   # (N, 1664)
 
         # Verify all L2-norms ≈ 1
         norms = np.linalg.norm(vectors, axis=1)
         print(f"  Vector norms — min: {norms.min():.4f}  max: {norms.max():.4f}  mean: {norms.mean():.4f}")
 
-        print(f"Building FAISS IndexFlatIP ({TOTAL_DIM}-dim) …")
-        index = build_index(vectors)
-
-        # Persist
+        # Persist vectors locally (for UMAP)
         np.save(VECTORS_PATH, vectors)
-        faiss.write_index(index, str(INDEX_PATH))
         with open(META_PATH, "w") as f:
             json.dump(
                 [
@@ -1175,7 +1170,11 @@ def main() -> None:
                 ],
                 f, indent=2, default=str,
             )
-        print(f"  Saved → {VECTORS_PATH}  {INDEX_PATH}  {META_PATH}")
+        print(f"  Saved → {VECTORS_PATH}  {META_PATH}")
+
+        # Upload to Qdrant with payload
+        ensure_title_collection()
+        upload_title_vectors(titles, vectors)
 
     # ── 6. Modality coverage report ───────────────────────────────────────
     covered     = len(visual_map)
@@ -1194,12 +1193,8 @@ def main() -> None:
     print(f"  Audio embeddings   : {has_audio}/{n}  ({100*has_audio//n}%)")
     print(f"  IMDB rating        : {has_rating}/{n}")
 
-    # ── 7. Build sub-indices for dual-encoder search ──────────────────────
-    print("Building text, visual, and audio sub-indices …")
-    text_index, visual_index, audio_index = build_sub_indices(vectors)
-
-    # ── 8. Interactive similarity search ─────────────────────────────────
-    interactive_search(text_index, visual_index, audio_index, titles, vectors, k=5)
+    # ── 7. Interactive fully-fused similarity search ─────────────────────
+    interactive_search(titles, vectors, k=5)
 
 
 if __name__ == "__main__":
