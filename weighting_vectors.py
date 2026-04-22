@@ -1,32 +1,22 @@
 """
-fused_search.py
-===============
-Fully-fused multimodal similarity search over the Genery title embedding index,
-backed by Qdrant for filtered nearest-neighbour search.
+weighting_vectors.py
+====================
+Variant of the fused title vector pipeline with type-dependent modality weighting.
 
-Vector layout  (1 664 dims, L2-normalised → cosine-equivalent search)
-  [    0 :  384 ]  text     – mean-pooled all-MiniLM-L6-v2 on title+desc+genres+keywords+cast
-  [  384 : 1152 ]  visual   – mean of SigLIP2 ViT-B (siglip-768) vectors from Qdrant
-  [ 1152 : 1664 ]  audio    – CLAP larger_clap_general audio encoder (zeros if no WAV)
+Instead of equal 1/3 weighting across text, visual, and audio, each media type
+gets its own set of weights applied before concatenation:
 
-Metadata (type, year, genres, popularity, imdb_rating, is_adult) is stored as
-Qdrant payload alongside each vector — not baked into the vector itself.
+  musicVideo : audio=0.50  text=0.25  visual=0.25  (audio is primary signal)
+  movie      : text=0.50   visual=0.35 audio=0.15  (narrative + aesthetics)
+  tvSeries   : text=0.55   visual=0.30 audio=0.15  (dialogue-heavy)
 
-At query time:
-  1. Infer the media type of the query title via a text sub-vector lookup in
-     Qdrant (strong match → use its type; fallback → majority vote; else no filter)
-  2. Build a 1664-dim fused query vector using the same three encoders
-  3. Search Qdrant with the fused vector and the inferred type filter
+Vectors produced here are stored in a separate Qdrant collection
+(QDRANT_WEIGHTED_COLLECTION) so they don't overwrite the equal-weight index.
 
 Usage
 -----
-  python fused_search.py            # 100 titles (default)
-  python fused_search.py --limit 300
-  python fused_search.py --rebuild  # force rebuild + re-upload to Qdrant
-
-Audio pre-requisite:
-  Run extract_audio.py first to populate ./audio/ with WAV files.
-  Titles without a WAV file get a zero audio sub-vector.
+  python weighting_vectors.py --type musicVideo --rebuild
+  python weighting_vectors.py --search-only
 """
 
 import os
@@ -97,11 +87,26 @@ TOTAL_DIM  = TEXT_DIM + VISUAL_DIM + AUDIO_DIM   # 2 048
 
 QDRANT_VECTOR_NAME = "siglip-768"
 
-# Qdrant collection for fused title vectors + payload
-_title_coll_env = "QDRANT_TITLE_EMBEDDINGS_COLLECTION"
+# Qdrant collection for weighted title vectors + payload
+# Uses a separate collection from fused_search.py to avoid overwriting
+_title_coll_env = "QDRANT_WEIGHTED_COLLECTION"
 TITLE_COLLECTION = os.environ.get(_title_coll_env)
 if not TITLE_COLLECTION:
     raise RuntimeError(f"Missing required environment variable: {_title_coll_env}")
+
+# ── Type-dependent modality weights (text, visual, audio) ────────────────────
+# Weights are applied by scaling each L2-normalised sub-vector before
+# concatenation. They do not need to sum to 1.0 — the final L2-normalisation
+# of the fused vector handles that. However keeping them summing to 1.0 makes
+# the intent readable.
+TYPE_WEIGHTS: dict[str, tuple[float, float, float]] = {
+    #              text   visual  audio
+    "musicVideo": (0.25,  0.25,   0.50),  # audio is the primary signal
+    "movie":      (0.50,  0.35,   0.15),  # narrative + visual aesthetics
+    "tvSeries":   (0.55,  0.30,   0.15),  # dialogue-heavy, text dominates
+}
+# Fallback for any type not listed above
+DEFAULT_WEIGHTS = (0.34, 0.33, 0.33)
 
 # Minimum text similarity score to treat top-1 as a specific title match.
 # Below this: only type filter (from majority vote).  At or above: type + artist/director.
@@ -123,8 +128,8 @@ AUDIO_SLICE  = slice(1536, 2048)   # CLAP audio sub-space
 
 YEAR_MIN, YEAR_MAX = 1900, 2025
 
-META_PATH    = Path("title_meta.json")
-VECTORS_PATH = Path("title_vectors.npy")
+META_PATH    = Path("weighted_meta.json")
+VECTORS_PATH = Path("weighted_vectors.npy")
 UMAP_2D_DIR  = Path("2d_umaps")
 UMAP_3D_DIR  = Path("3d_umaps")
 UMAP_PATH    = UMAP_3D_DIR / "umap_titles.html"
@@ -617,19 +622,24 @@ def build_title_vector(
     audio_map: dict[str, np.ndarray],
 ) -> np.ndarray:
     """
-    L2-normalise each modality vector individually, concatenate, then
-    L2-normalise the fused result.
-    Missing modalities (no WAV, no Qdrant vector) contribute zero sub-vectors,
-    so the final norm is driven by whichever modalities are present.
+    Build a fused title vector with type-dependent modality weighting.
 
-    Metadata (type, year, genres, etc.) is no longer baked into the vector —
-    it is stored as Qdrant payload alongside the vector instead.
+    Each modality sub-vector is L2-normalised first, then scaled by the
+    weight defined in TYPE_WEIGHTS for this title's media type, then
+    concatenated and L2-normalised again.
+
+    musicVideo : audio×0.50  text×0.25  visual×0.25
+    movie      : text×0.50   visual×0.35  audio×0.15
+    tvSeries   : text×0.55   visual×0.30  audio×0.15
     """
+    media_type = row.get("type") or ""
+    wt, wv, wa = TYPE_WEIGHTS.get(media_type, DEFAULT_WEIGHTS)
+
     persons = persons_map.get(int(row["id"]))
-    t_vec = _l2_normalise(encode_text(row, persons))              # (384,)
-    v_vec = _l2_normalise(encode_visual(row["id"], visual_map))   # (768,)
-    a_vec = _l2_normalise(encode_audio(row["cuid2"], audio_map))  # (512,)
-    fused = np.concatenate([t_vec, v_vec, a_vec])                 # (1664,)
+    t_vec = _l2_normalise(encode_text(row, persons))            * wt  # (768,)
+    v_vec = _l2_normalise(encode_visual(row["id"], visual_map)) * wv  # (768,)
+    a_vec = _l2_normalise(encode_audio(row["cuid2"], audio_map)) * wa  # (512,)
+    fused = np.concatenate([t_vec, v_vec, a_vec])
     return _l2_normalise(fused)
 
 
@@ -826,21 +836,22 @@ def infer_query_context(raw: str) -> dict:
 # 8.  Fully-fused similarity search
 # ──────────────────────────────────────────────────────────────────────────────
 
-def _build_query_vector(raw: str) -> np.ndarray:
+def _build_query_vector(raw: str, media_type: str | None = None) -> np.ndarray:
     """
-    Build a 1664-dim fused query vector using the same pipeline as title vectors:
-      1. all-MiniLM text encoding  → L2-normalise → TEXT_SLICE
-      2. SigLIP2 text encoding     → L2-normalise → VISUAL_SLICE
-      3. CLAP text encoding        → L2-normalise → AUDIO_SLICE
-      concatenate → 1664-dim → L2-normalise
+    Build a fused query vector using the same type-dependent weights as
+    build_title_vector(), so query and title vectors live in the same
+    weighted sub-space and cosine similarity is meaningful.
 
-    No metadata slice — metadata lives in Qdrant payload and is applied as a
-    filter, not baked into the vector.
+    media_type: one of 'musicVideo', 'movie', 'tvSeries'.
+                Defaults to 'musicVideo' since this collection is music-focused.
+                Pass None to use DEFAULT_WEIGHTS (equal weighting).
     """
-    t_vec = _l2_normalise(encode_query_text(raw))    # (384,)
-    v_vec = _l2_normalise(encode_query_visual(raw))  # (768,)
-    a_vec = _l2_normalise(encode_query_audio(raw))   # (512,)
-    fused = np.concatenate([t_vec, v_vec, a_vec])    # (1664,)
+    wt, wv, wa = TYPE_WEIGHTS.get(media_type or "musicVideo", DEFAULT_WEIGHTS)
+
+    t_vec = _l2_normalise(encode_query_text(raw))    * wt  # (768,)
+    v_vec = _l2_normalise(encode_query_visual(raw))  * wv  # (768,)
+    a_vec = _l2_normalise(encode_query_audio(raw))   * wa  # (512,)
+    fused = np.concatenate([t_vec, v_vec, a_vec])
     return _l2_normalise(fused)
 
 
@@ -896,34 +907,15 @@ def interactive_search(
 
         print("  Encoding query …")
 
-        # ── Step 1: infer context (type + person ids) from Qdrant index ──
-        context = infer_query_context(raw)
+        # ── Step 1: build fused query vector (musicVideo weights) ────────
+        query_full = _build_query_vector(raw, media_type="musicVideo")
 
-        # ── Step 2: build fused query vector ─────────────────────────────
-        query_full = _build_query_vector(raw)   # (1664,) unit vector
-
-        # ── Step 3: build filter and search Qdrant ────────────────────────
-        must_conditions = []
-        if context["type"]:
-            must_conditions.append(
-                FieldCondition(key="type", match=MatchValue(value=context["type"]))
-            )
-        if context["artist_ids"]:
-            must_conditions.append(
-                FieldCondition(key="artist_ids", match=MatchAny(any=context["artist_ids"]))
-            )
-        if context["director_ids"]:
-            must_conditions.append(
-                FieldCondition(key="director_ids", match=MatchAny(any=context["director_ids"]))
-            )
-
-        search_filter = Filter(must=must_conditions) if must_conditions else None
-
+        # ── Step 2: search Qdrant — no filters applied ────────────────────
         response = qdrant.query_points(
             collection_name=TITLE_COLLECTION,
             query=query_full.tolist(),
             using="fused",
-            query_filter=search_filter,
+            query_filter=None,
             limit=k,
             with_payload=True,
         )
@@ -934,15 +926,7 @@ def interactive_search(
         ]
 
         # ── Display results ───────────────────────────────────────────────
-        filter_parts = []
-        if context["type"]:
-            filter_parts.append(f"type='{context['type']}'")
-        if context["artist_ids"]:
-            filter_parts.append(f"artist filter")
-        if context["director_ids"]:
-            filter_parts.append(f"director filter")
-        filter_label = "  " + " · ".join(filter_parts) if filter_parts else "  no filter"
-        print(f"\n  Query  →  «{raw}»  [{filter_label}]")
+        print(f"\n  Query  →  «{raw}»  [no filter]")
         print("  " + "-" * 65)
         print(f"  {'#':<4} {'cosine':<8}  title")
         print("  " + "-" * 65)
